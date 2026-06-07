@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+paper.pdf
+paper_text.txt
+summary.txt
+generated_code.txt
+.env.env
