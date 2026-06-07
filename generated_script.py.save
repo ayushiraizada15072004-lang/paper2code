@@ -1,0 +1,411 @@
+This document focuses on AWS Data Ingestion, primarily using the Kinesis family. Below are Python code examples demonstrating how you would interact with these services using `boto3`, covering producers, basic consumers, and management tasks.
+
+**Prerequisites:**
+
+1.  **Install `boto3`:**
+    ```bash
+    pip install boto3
+    ```
+2.  **AWS Credentials Configuration:** Ensure your AWS credentials are configured (e.g., via `~/.aws/credentials`, environment variables like `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or an IAM role for EC2/Lambda).
+3.  **AWS Resources:** You will need to create the Kinesis Data Stream and Kinesis Data Firehose Delivery Stream in your AWS account with the specified names for the examples to run successfully.
+
+---
+
+```python
+import boto3
+import json
+import time
+import base64
+import os
+from datetime import datetime
+import random # For generating sample data
+
+# --- AWS Configuration (Replace with your actual values or environment variables) ---
+# It's recommended to set these as environment variables or use a configuration file.
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+KDS_STREAM_NAME = os.getenv("KDS_STREAM_NAME", "MyRealtimeDataStream") # Create this Kinesis Data Stream
+KDF_DELIVERY_STREAM_NAME = os.getenv("KDF_DELIVERY_STREAM_NAME", "MyFirehoseDeliveryStream") # Create this Kinesis Data Firehose Delivery Stream
+KDA_APPLICATION_NAME = os.getenv("KDA_APPLICATION_NAME", "MyFlinkAnalyticsApp") # Optional, for KDA example if you have one
+
+# Initialize boto3 clients
+kinesis_client = boto3.client("kinesis", region_name=AWS_REGION)
+firehose_client = boto3.client("firehose", region_name=AWS_REGION)
+kinesis_analytics_client = boto3.client("kinesisanalyticsv2", region_name=AWS_REGION)
+
+print(f"AWS Region: {AWS_REGION}")
+print(f"Kinesis Data Stream Name: {KDS_STREAM_NAME}")
+print(f"Kinesis Data Firehose Delivery Stream Name: {KDF_DELIVERY_STREAM_NAME}\n")
+
+
+# --- Helper Functions for Simulating Data ---
+def generate_iot_sensor_data(device_id_prefix="iot_sensor_", num_devices=5):
+    """Generates a sample IoT sensor reading."""
+    device_id = device_id_prefix + str(random.randint(1, num_devices))
+    temperature = round(random.uniform(20.0, 30.0), 2)
+    humidity = round(random.uniform(40.0, 60.0), 2)
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    return {
+        "device_id": device_id,
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": timestamp,
+        "event_type": "sensor_reading",
+    }
+
+
+def generate_web_click_data(user_id_prefix="user_", num_users=10):
+    """Generates a sample web click event."""
+    user_id = user_id_prefix + str(random.randint(1, num_users))
+    product_id = "prod_" + str(random.randint(100, 999))
+    action = random.choice(["view", "add_to_cart", "purchase"])
+    ip_address = f"192.168.1.{random.randint(1, 254)}"
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    return {
+        "user_id": user_id,
+        "product_id": product_id,
+        "action": action,
+        "ip_address": ip_address,
+        "timestamp": timestamp,
+        "event_type": "web_click",
+    }
+
+
+# --- Python Code Examples Based on Summary ---
+
+print("--- Starting Python Kinesis Examples ---")
+
+# region 1. Kinesis Data Streams (KDS) Producer Example
+print("\n--- 1. Kinesis Data Streams (KDS) Producer Example ---")
+print("Description: Demonstrates how a Python application acts as a 'Producer' to send data to Kinesis Data Streams using boto3.")
+print("Concepts: Real-time Streaming, Producers, Partition Key, Shards, boto3.client('kinesis').put_record / put_records.")
+print(f"AWS Setup: An active Kinesis Data Stream named '{KDS_STREAM_NAME}' must exist.")
+
+try:
+    # Example 1.1: Put a single record using put_record
+    print("\n  1.1: Putting a single record (e.g., IoT sensor data)...")
+    record_data_sensor = generate_iot_sensor_data()
+    # The Partition Key is crucial for shard assignment, ensuring related events stay together.
+    partition_key_sensor = record_data_sensor["device_id"]
+    data_payload_sensor = json.dumps(record_data_sensor) + "\n" # Kinesis often works well with newline-delimited JSON
+
+    response_single = kinesis_client.put_record(
+        StreamName=KDS_STREAM_NAME,
+        Data=data_payload_sensor.encode('utf-8'), # Data must be bytes
+        PartitionKey=partition_key_sensor
+    )
+    print(f"  Successfully put single record to KDS. ShardId: {response_single['ShardId']}, SequenceNumber: {response_single['SequenceNumber']}")
+    print(f"  Data sent: {record_data_sensor}")
+
+    # Example 1.2: Put multiple records in a batch using put_records (more efficient)
+    print("\n  1.2: Putting multiple records in a batch (e.g., web clicks) using put_records for efficiency...")
+    records_to_send_batch = []
+    for i in range(3):
+        data = generate_web_click_data()
+        records_to_send_batch.append({
+            'Data': (json.dumps(data) + "\n").encode('utf-8'),
+            'PartitionKey': data['user_id'] # Use user_id as PartitionKey
+        })
+    batch_response = kinesis_client.put_records(
+        StreamName=KDS_STREAM_NAME,
+        Records=records_to_send_batch
+    )
+    print(f"  Successfully attempted to put {len(records_to_send_batch)} records in batch.")
+    print(f"  Failed records count: {batch_response.get('FailedRecordCount', 0)}")
+    if batch_response.get('FailedRecordCount', 0) > 0:
+        print(f"  Details of failed records: {batch_response.get('Records')}")
+
+
+except kinesis_client.exceptions.ResourceNotFoundException:
+    print(f"Error: Kinesis Data Stream '{KDS_STREAM_NAME}' not found. Please create it in {AWS_REGION}.")
+except Exception as e:
+    print(f"Error putting record to KDS: {e}")
+# endregion
+
+# region 2. Kinesis Data Streams (KDS) Consumer (Basic Polling Example)
+print("\n--- 2. Kinesis Data Streams (KDS) Consumer (Basic Polling) Example ---")
+print("Description: Illustrates a simple, non-production Python consumer reading from a Kinesis stream. ")
+print("             NOTE: The Kinesis Client Library (KCL) is recommended for robust, scalable Python consumers,")
+print("             handling shard discovery, load balancing, and checkpointing. This example uses the raw boto3 API.")
+print("Concepts: Consumers, Shards, boto3.client('kinesis').describe_stream, get_shard_iterator, get_records.")
+print(f"AWS Setup: An active Kinesis Data Stream named '{KDS_STREAM_NAME}' with data must exist (e.g., from the producer example).")
+
+try:
+    # 1. Get stream description to find shards
+    describe_stream_response = kinesis_client.describe_stream(StreamName=KDS_STREAM_NAME)
+    shards = describe_stream_response['StreamDescription']['Shards']
+    print(f"Found {len(shards)} shards in stream '{KDS_STREAM_NAME}'.")
+
+    # For demonstration, we'll only read from the first shard found
+    if shards:
+        shard_id = shards[0]['ShardId']
+        print(f"Attempting to read from ShardId: {shard_id}")
+
+        # 2. Get a shard iterator
+        # ShardIteratorType: TRIM_HORIZON (start from oldest available), LATEST (start from now),
+        # AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP
+        shard_iterator_response = kinesis_client.get_shard_iterator(
+            StreamName=KDS_STREAM_NAME,
+            ShardId=shard_id,
+            ShardIteratorType='LATEST' # Read from the most recent data
+            # ShardIteratorType='TRIM_HORIZON' # Read from the beginning of the retention period
+        )
+        shard_iterator = shard_iterator_response['ShardIterator']
+        print(f"Obtained ShardIterator for shard {shard_id}.")
+
+        # 3. Read records using the iterator in a loop
+        print("Polling for records (will read up to 5 records from this run or until no more are immediately available)...")
+        read_count = 0
+        while shard_iterator and read_count < 5: # Limit for demo purposes
+            get_records_response = kinesis_client.get_records(
+                ShardIterator=shard_iterator,
+                Limit=10 # Max records to retrieve per call
+            )
+
+            records = get_records_response['Records']
+            if records:
+                for record in records:
+                    data = record['Data'].decode('utf-8').strip() # Decode bytes and remove newline
+                    partition_key = record['PartitionKey']
+                    sequence_number = record['SequenceNumber']
+                    approx_arrival_time = record['ApproximateArrivalTimestamp']
+                    print(f"  [Shard: {shard_id}] Data: {data}, PartitionKey: {partition_key}, Sequence: {sequence_number}, Time: {approx_arrival_time}")
+                    read_count += 1
+                print(f"  Read {len(records)} records.")
+            else:
+                print("  No new records available in this poll.")
+
+            # Update shard iterator for the next call
+            shard_iterator = get_records_response.get('NextShardIterator')
+            if not shard_iterator:
+                print("  No more records to read for now, or stream end reached for this shard.")
+                break
+            time.sleep(1) # Wait before next poll to avoid hitting rate limits too quickly
+
+    else:
+        print(f"No shards found for stream '{KDS_STREAM_NAME}'. Cannot read.")
+
+except kinesis_client.exceptions.ResourceNotFoundException:
+    print(f"Error: Kinesis Data Stream '{KDS_STREAM_NAME}' not found. Please create it.")
+except Exception as e:
+    print(f"Error reading from KDS: {e}")
+# endregion
+
+# region 3. Kinesis Data Firehose (KDF) Producer Example
+print("\n--- 3. Kinesis Data Firehose (KDF) Producer Example ---")
+print("Description: Demonstrates sending data to a Kinesis Data Firehose delivery stream. ")
+print("             Firehose is a fully managed service; it handles buffering, compression, and delivery to destinations,")
+print("             so no custom consumer code is typically needed for these downstream steps.")
+print("Concepts: Managed Service, Kinesis Data Firehose, Producers, Buffering, Compression, boto3.client('firehose').put_record / put_record_batch.")
+print(f"AWS Setup: An active Kinesis Data Firehose Delivery Stream named '{KDF_DELIVERY_STREAM_NAME}' must exist.")
+print("             It should be configured to deliver to a destination like S3, Redshift, or OpenSearch.")
+
+try:
+    # Example 3.1: Put a single record to KDF
+    print("\n  3.1: Putting a single record (e.g., web click data) to Firehose...")
+    record_data_click = generate_web_click_data()
+    data_payload_click = json.dumps(record_data_click) + "\n" # Firehose also works well with newline delimited JSON
+
+    response_firehose_single = firehose_client.put_record(
+        DeliveryStreamName=KDF_DELIVERY_STREAM_NAME,
+        Record={
+            'Data': data_payload_click.encode('utf-8') # Data must be bytes
+        }
+    )
+    print(f"  Successfully put single record to KDF. RecordId: {response_firehose_single['RecordId']}")
+    print(f"  Data sent: {record_data_click}")
+
+    # Example 3.2: Put multiple records in a batch using put_record_batch (more efficient)
+    print("\n  3.2: Putting multiple records in a batch (e.g., IoT sensor data) using put_record_batch...")
+    records_to_send_firehose_batch = []
+    for _ in range(2):
+        data = generate_iot_sensor_data()
+        records_to_send_firehose_batch.append({
+            'Data': (json.dumps(data) + "\n").encode('utf-8')
+        })
+    batch_response_firehose = firehose_client.put_record_batch(
+        DeliveryStreamName=KDF_DELIVERY_STREAM_NAME,
+        Records=records_to_send_firehose_batch
+    )
+    print(f"  Successfully attempted to put {len(records_to_send_firehose_batch)} records in batch to Firehose.")
+    print(f"  Failed records count: {batch_response_firehose.get('FailedPutCount', 0)}")
+
+
+except firehose_client.exceptions.ResourceNotFoundException:
+    print(f"Error: Kinesis Data Firehose Delivery Stream '{KDF_DELIVERY_STREAM_NAME}' not found. Please create it in {AWS_REGION}.")
+except Exception as e:
+    print(f"Error putting record to KDF: {e}")
+# endregion
+
+# region 4. Lambda Transformation Function (Example for Kinesis Data Firehose)
+print("\n--- 4. Lambda Transformation Function (Example for Kinesis Data Firehose) ---")
+print("Description: This is a *simulated* Python Lambda function that Kinesis Data Firehose would invoke to transform data. ")
+print("             It takes Firehose event data, processes it, and returns transformed records. This code runs *in* Lambda, not as a direct interaction with Kinesis from Python.")
+print("Concepts: AWS Lambda, Data Transformations, Firehose event structure (base64 encoding for data).")
+print("AWS Setup: This code would be deployed as an AWS Lambda function and configured as a data transformation step within a Kinesis Data Firehose Delivery Stream.")
+
+def lambda_handler(event, context):
+    """
+    Simulates a Lambda function that transforms records from Kinesis Data Firehose.
+    """
+    output = []
+    for record in event['records']:
+        # Kinesis Firehose sends data Base64 encoded.
+        payload = base64.b64decode(record['data']).decode('utf-8')
+        try:
+            data = json.loads(payload)
+
+            # --- Apply your custom transformation logic here ---
+            # Example 1: Add a processing timestamp
+            data["processing_timestamp"] = datetime.utcnow().isoformat() + "Z"
+            # Example 2: Enrich data (e.g., if it's sensor data, add a status based on temperature)
+            if "temperature" in data:
+                data["temperature_status"] = "normal" if 20 <= data["temperature"] <= 28 else "alert"
+            # Example 3: Filter out records (e.g., ignore records below a certain temperature threshold)
+            if data.get("temperature", 0) < 18:
+                print(f"  [Lambda] Skipping record (ID: {record['recordId']}) due to low temperature: {data.get('temperature')}°C")
+                # You can explicitly drop the record by marking its result as 'Dropped'
+                # For this example, we just 'continue' to not add it to output.
+                # If you need to return it but mark as dropped, use:
+                # output.append({'recordId': record['recordId'], 'result': 'Dropped', 'data': record['data']})
+                continue
+
+            # Re-encode the transformed data back to base64
+            transformed_data = json.dumps(data) + "\n"
+            output_record_data = base64.b64encode(transformed_data.encode('utf-8')).decode('utf-8')
+
+            output.append({
+                'recordId': record['recordId'],
+                'result': 'Ok', # 'Ok', 'ProcessingFailed', 'Dropped'
+                'data': output_record_data
+            })
+
+        except Exception as e:
+            print(f"  [Lambda] Error processing record {record['recordId']}: {e}")
+            # If processing fails for a record, mark it as 'ProcessingFailed'
+            output.append({
+                'recordId': record['recordId'],
+                'result': 'ProcessingFailed',
+                'data': record['data'] # Return original data on failure for inspection
+            })
+
+    print(f"  [Lambda] Processed {len(event['records'])} incoming records, outputting {len(output)} records.")
+    return {'records': output}
+
+# Simulate a Firehose event structure for local testing of the Lambda handler
+print("\n  Simulating a Kinesis Data Firehose event invocation for the Lambda function:")
+simulated_firehose_event = {
+    'invocationId': 'testInvocationId123',
+    'deliveryStreamArn': f'arn:aws:kinesis:{AWS_REGION}:123456789012:deliverystream/{KDF_DELIVERY_STREAM_NAME}',
+    'sourceKinesisStreamArn': None, # Can be populated if KDF source is KDS
+    'records': [
+        {
+            'recordId': 'recordId001',
+            'approximateArrivalTimestamp': 1678886400000,
+            'data': base64.b64encode(json.dumps(generate_iot_sensor_data(device_id_prefix="dev_a_")).encode('utf-8')).decode('utf-8')
+        },
+        {
+            'recordId': 'recordId002',
+            'approximateArrivalTimestamp': 1678886401000,
+            # Example data that might trigger the filter (low temperature)
+            'data': base64.b64encode(json.dumps({"device_id": "temp_sensor_low", "temperature": 15, "humidity": 50, "timestamp": "2023-01-01T00:00:00Z"}).encode('utf-8')).decode('utf-8')
+        },
+        {
+            'recordId': 'recordId003',
+            'approximateArrivalTimestamp': 1678886402000,
+            'data': base64.b64encode(json.dumps(generate_web_click_data(user_id_prefix="web_user_")).encode('utf-8')).decode('utf-8')
+        }
+    ]
+}
+
+transformed_output_from_lambda = lambda_handler(simulated_firehose_event, {})
+for rec_out in transformed_output_from_lambda['records']:
+    decoded_data = base64.b64decode(rec_out['data']).decode('utf-8').strip()
+    print(f"    Output Record ID: {rec_out['recordId']}, Result: {rec_out['result']}, Data: {decoded_data}")
+
+# endregion
+
+# region 5. Kinesis Data Analytics (Managed Apache Flink) - Service Management Example
+print("\n--- 5. Kinesis Data Analytics (Managed Apache Flink) - Service Management Example ---")
+print("Description: Shows how Python (`boto3`) can interact with the Kinesis Data Analytics service for management tasks,")
+print("             such as listing existing applications. The actual Flink application logic (SQL or Flink APIs in Java/Scala/Python) is deployed *to* the service, not written in Python here.")
+print("Concepts: Real-time Stream Processing, Managed Service, Kinesis Data Analytics (Managed Apache Flink), boto3.client('kinesisanalyticsv2').")
+print("AWS Setup: One or more Kinesis Data Analytics Flink applications might exist in your account.")
+
+try:
+    print("\n  Listing Kinesis Data Analytics applications in your account...")
+    response_list_apps = kinesis_analytics_client.list_applications(
+        Limit=5 # Limit for demonstration
+    )
+
+    applications = response_list_apps.get('ApplicationSummaries', [])
+    if applications:
+        for app in applications:
+            print(f"  - Application Name: {app['ApplicationName']}")
+            print(f"    Status: {app['ApplicationStatus']}")
+            print(f"    Runtime: {app['RuntimeEnvironment']}")
+            print(f"    ARN: {app['ApplicationARN']}")
+            print("-" * 20)
+    else:
+        print("  No Kinesis Data Analytics applications found.")
+
+    # Example: Describe a specific application (if it exists)
+    if applications and KDA_APPLICATION_NAME:
+        # Use the configured KDA_APPLICATION_NAME or the first found application
+        app_to_describe = KDA_APPLICATION_NAME if any(app['ApplicationName'] == KDA_APPLICATION_NAME for app in applications) else applications[0]['ApplicationName']
+        print(f"\n  Attempting to describe application '{app_to_describe}'...")
+        try:
+            describe_app_response = kinesis_analytics_client.describe_application(
+                ApplicationName=app_to_describe,
+                IncludeAdditionalDetails=True
+            )
+            print(f"    Description for '{app_to_describe}':")
+            print(f"      Application Status: {describe_app_response['ApplicationDetail']['ApplicationStatus']}")
+            print(f"      Application Version: {describe_app_response['ApplicationDetail']['ApplicationVersionId']}")
+            # print(json.dumps(describe_app_response['ApplicationDetail'], indent=2)) # Uncomment for full details
+        except kinesis_analytics_client.exceptions.ResourceNotFoundException:
+            print(f"    Application '{app_to_describe}' not found.")
+        except Exception as e:
+            print(f"    Error describing application '{app_to_describe}': {e}")
+
+
+except Exception as e:
+    print(f"Error interacting with Kinesis Data Analytics service: {e}")
+# endregion
+
+print("\n--- Kinesis Python Examples Finished ---")
+
+# --- Installation and Configuration Notes ---
+print("\n--- Important Notes for Running these Examples ---")
+print("1. **AWS Setup**: Before running, ensure you have created:")
+print(f"   - A Kinesis Data Stream named '{KDS_STREAM_NAME}'.")
+print(f"   - A Kinesis Data Firehose Delivery Stream named '{KDF_DELIVERY_STREAM_NAME}', configured to deliver to an S3 bucket.")
+print("     (For the Lambda example, optionally configure the KDF stream to use a Lambda transformation.)")
+print("   - For the Kinesis Data Analytics example, an application with the specified name is helpful but optional for `list_applications`.")
+print("2. **IAM Permissions**: Your AWS credentials must have the necessary IAM permissions:")
+print(f"   - `kinesis:PutRecord`, `kinesis:PutRecords`, `kinesis:DescribeStream`, `kinesis:GetShardIterator`, `kinesis:GetRecords` for KDS.")
+print(f"   - `firehose:PutRecord`, `firehose:PutRecordBatch` for KDF.")
+print(f"   - `kinesisanalytics:ListApplications`, `kinesisanalytics:DescribeApplication` for KDA.")
+print("3. **Lambda Function Deployment**: The Lambda transformation example (Section 4) is a *simulated* local run. In a real scenario, you would deploy this Python code as an AWS Lambda function, and then configure your Kinesis Data Firehose delivery stream to invoke it for data transformation.")
+print("4. **Kinesis Client Library (KCL)**: For robust Kinesis Data Streams consumers in Python, consider libraries like `amazon-kinesis-client` (a Python wrapper for KCL) which handles complex tasks like checkpointing, shard discovery, and load balancing across multiple consumer instances.")
+```
+
+python generated_script.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"/Users/ayushiraizada/Documents/AWS FOLDER/.venv/bin/python" "/Users/ayushiraizada/Documents/AWS FOLDER/papercode2/app.py"
+"/Users/ayushiraizada/Documents/AWS FOLDER/.venv/bin/python" "/Users/ayushiraizada/Documents/AWS FOLDER/papercode2/app.py"
+

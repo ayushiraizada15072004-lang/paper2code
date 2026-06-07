@@ -1,0 +1,15 @@
+import streamlit as st
+
+st.title("AI Research Paper Summarizer")
+
+uploaded_file = st.file_uploader("Upload PDF")
+
+if uploaded_file:
+    st.success("PDF Uploaded Successfully")
+
+
+
+
+
+
+

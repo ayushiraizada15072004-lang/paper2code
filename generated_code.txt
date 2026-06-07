@@ -1,0 +1,468 @@
+Okay, this summary provides an excellent foundation for generating Python `boto3` code examples related to AWS Kinesis services for data ingestion.
+
+The examples will cover:
+1.  **Kinesis Data Streams (KDS) Producer:** Sending individual and batched records.
+2.  **Kinesis Data Streams (KDS) Consumer:** A basic polling consumer (KCL is a library, not a direct `boto3` call, so we'll simulate its core logic).
+3.  **Kinesis Data Firehose Producer:** Sending records to a delivery stream.
+4.  **Conceptual Overview of Firehose Transformation with Lambda:** Explaining how it works without writing the Lambda itself.
+
+---
+
+```python
+import boto3
+import json
+import time
+import random
+import os
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- AWS Configuration ---
+# Ensure your AWS credentials are configured:
+# 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+# 2. AWS credentials file (~/.aws/credentials)
+# 3. IAM role attached to your EC2 instance or other AWS service
+# 4. AWS_REGION environment variable or specified in client creation
+#    e.g., os.environ['AWS_REGION'] = 'us-east-1'
+
+# Initialize boto3 clients
+kinesis_client = boto3.client('kinesis')
+firehose_client = boto3.client('firehose')
+# s3_client = boto3.client('s3') # For S3 bucket creation if needed for Firehose setup
+
+# --- Configuration for our examples ---
+KINESIS_STREAM_NAME = "MyUnit2DataStream"
+FIREHOSE_STREAM_NAME = "MyUnit2FirehoseStream" # This stream needs to be pre-created, e.g., to S3
+SHARD_COUNT = 1 # For simplicity, start with 1 shard. In production, determine based on throughput needs.
+REGION = os.environ.get('AWS_REGION', 'us-east-1') # Default to us-east-1 if not set
+
+# --- Helper Functions ---
+
+def generate_iot_data(device_id_prefix="device"):
+    """Generates a sample IoT device reading."""
+    device_id = f"{device_id_prefix}-{random.randint(1, 100)}"
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    temperature = round(random.uniform(20.0, 30.0), 2)
+    humidity = round(random.uniform(50.0, 70.0), 2)
+    pressure = round(random.uniform(900.0, 1100.0), 2)
+    return {
+        "device_id": device_id,
+        "timestamp": timestamp,
+        "location": f"lat:{round(random.uniform(-90, 90), 4)},lon:{round(random.uniform(-180, 180), 4)}",
+        "sensor_readings": {
+            "temperature_c": temperature,
+            "humidity_percent": humidity,
+            "pressure_hpa": pressure
+        },
+        "event_type": "sensor_reading"
+    }
+
+def generate_log_data(user_id_prefix="user"):
+    """Generates sample application log data."""
+    user_id = f"{user_id_prefix}-{random.randint(1, 50)}"
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    log_levels = ["INFO", "WARN", "ERROR", "DEBUG"]
+    messages = [
+        "User logged in successfully.",
+        "Attempted to access restricted resource.",
+        "Database query timed out.",
+        "Processed data batch.",
+        "API call failed with status 404.",
+        "Configuration reloaded."
+    ]
+    return {
+        "timestamp": timestamp,
+        "user_id": user_id,
+        "level": random.choice(log_levels),
+        "message": random.choice(messages),
+        "service": "webapp-service",
+        "transaction_id": str(random.randint(10000, 99999))
+    }
+
+def wait_for_stream_status(client, stream_name, desired_status, description_func, stream_type="Kinesis Data Stream", max_attempts=60, wait_interval=5):
+    """Waits for a Kinesis stream or Firehose stream to reach a desired status."""
+    logger.info(f"Waiting for {stream_type} '{stream_name}' to reach status '{desired_status}'...")
+    for attempt in range(max_attempts):
+        try:
+            response = description_func(StreamName=stream_name) if stream_type == "Kinesis Data Stream" else description_func(DeliveryStreamName=stream_name)
+            current_status = response['StreamDescription']['StreamStatus'] if stream_type == "Kinesis Data Stream" else response['DeliveryStreamDescription']['DeliveryStreamStatus']
+            if current_status == desired_status:
+                logger.info(f"{stream_type} '{stream_name}' is now '{desired_status}'.")
+                return True
+            logger.info(f"Current status: {current_status}. Retrying in {wait_interval} seconds...")
+        except client.exceptions.ResourceNotFoundException:
+            logger.warning(f"{stream_type} '{stream_name}' not found. It might still be creating or doesn't exist.")
+        except Exception as e:
+            logger.error(f"Error checking {stream_type} status: {e}")
+        time.sleep(wait_interval)
+    logger.error(f"Timed out waiting for {stream_type} '{stream_name}' to reach status '{desired_status}'.")
+    return False
+
+# --- Kinesis Data Streams (KDS) Examples ---
+
+def create_kinesis_stream():
+    """
+    Creates a Kinesis Data Stream.
+    Reflects the need to manage streams (creation, deletion).
+    """
+    try:
+        logger.info(f"Attempting to create Kinesis Data Stream: {KINESIS_STREAM_NAME} with {SHARD_COUNT} shard(s).")
+        kinesis_client.create_stream(
+            StreamName=KINESIS_STREAM_NAME,
+            ShardCount=SHARD_COUNT
+        )
+        if wait_for_stream_status(kinesis_client, KINESIS_STREAM_NAME, 'ACTIVE', kinesis_client.describe_stream):
+            logger.info(f"Kinesis Stream '{KINESIS_STREAM_NAME}' created successfully.")
+    except kinesis_client.exceptions.ResourceInUseException:
+        logger.warning(f"Kinesis Stream '{KINESIS_STREAM_NAME}' already exists.")
+        if wait_for_stream_status(kinesis_client, KINESIS_STREAM_NAME, 'ACTIVE', kinesis_client.describe_stream):
+            logger.info(f"Kinesis Stream '{KINESIS_STREAM_NAME}' is active.")
+    except Exception as e:
+        logger.error(f"Error creating Kinesis Stream: {e}")
+
+def delete_kinesis_stream():
+    """
+    Deletes a Kinesis Data Stream.
+    Important for cleanup and avoiding ongoing costs.
+    """
+    try:
+        logger.info(f"Attempting to delete Kinesis Data Stream: {KINESIS_STREAM_NAME}.")
+        kinesis_client.delete_stream(
+            StreamName=KINESIS_STREAM_NAME
+        )
+        logger.info(f"Kinesis Stream '{KINESIS_STREAM_NAME}' deletion initiated.")
+        # Optional: Add a wait for deletion completion if needed
+    except kinesis_client.exceptions.ResourceNotFoundException:
+        logger.warning(f"Kinesis Stream '{KINESIS_STREAM_NAME}' not found, nothing to delete.")
+    except Exception as e:
+        logger.error(f"Error deleting Kinesis Stream: {e}")
+
+def kinesis_producer_single_record(data_count=5):
+    """
+    Simulates a producer sending individual records to Kinesis Data Streams.
+    Highlights `Partition Key` and `Data` (must be bytes).
+    """
+    logger.info(f"\n--- Kinesis Data Streams Producer (Single Record) ---")
+    for i in range(data_count):
+        data = generate_iot_data()
+        partition_key = data['device_id'] # Use device_id as partition key to group data for a device
+        record_data = json.dumps(data).encode('utf-8')
+
+        try:
+            response = kinesis_client.put_record(
+                StreamName=KINESIS_STREAM_NAME,
+                Data=record_data,
+                PartitionKey=partition_key
+            )
+            logger.info(f"Sent record {i+1}: PartitionKey='{partition_key}', ShardId='{response['ShardId']}'")
+            time.sleep(0.1) # Simulate some delay
+        except Exception as e:
+            logger.error(f"Error sending record to KDS: {e}")
+            break
+    logger.info(f"Finished sending {data_count} single records to {KINESIS_STREAM_NAME}.")
+
+def kinesis_producer_batch_records(batch_count=3, records_per_batch=5):
+    """
+    Simulates a producer sending records in batches to Kinesis Data Streams.
+    This mimics the efficiency benefits of KPL (Kinesis Producer Library).
+    """
+    logger.info(f"\n--- Kinesis Data Streams Producer (Batch Records) ---")
+    for b in range(batch_count):
+        records = []
+        for i in range(records_per_batch):
+            data = generate_log_data()
+            partition_key = data['user_id'] # Use user_id as partition key
+            record_data = json.dumps(data).encode('utf-8')
+            records.append({
+                'Data': record_data,
+                'PartitionKey': partition_key
+            })
+
+        try:
+            response = kinesis_client.put_records(
+                StreamName=KINESIS_STREAM_NAME,
+                Records=records
+            )
+            failed_count = response.get('FailedRecordCount', 0)
+            logger.info(f"Sent batch {b+1} with {len(records)} records. Failed: {failed_count}.")
+            if failed_count > 0:
+                for record_result in response['Records']:
+                    if 'ErrorCode' in record_result:
+                        logger.error(f"  Failed Record: ErrorCode={record_result['ErrorCode']}, ErrorMessage={record_result['ErrorMessage']}")
+            time.sleep(0.5) # Simulate some delay
+        except Exception as e:
+            logger.error(f"Error sending batch to KDS: {e}")
+            break
+    logger.info(f"Finished sending {batch_count} batches (total {batch_count * records_per_batch} records) to {KINESIS_STREAM_NAME}.")
+
+
+def kinesis_basic_consumer(duration_seconds=30):
+    """
+    Simulates a basic consumer polling records from Kinesis Data Streams.
+    This is *not* a full KCL replacement but demonstrates reading from shards.
+    Highlights `Shard` concept. Enhanced Fan-Out provides dedicated throughput,
+    but this basic example just shows polling.
+    """
+    logger.info(f"\n--- Kinesis Data Streams Consumer (Basic Polling) ---")
+    try:
+        # 1. Get stream description to find shards
+        response = kinesis_client.describe_stream(StreamName=KINESIS_STREAM_NAME)
+        shards = response['StreamDescription']['Shards']
+        logger.info(f"Found {len(shards)} shards in stream '{KINESIS_STREAM_NAME}'.")
+
+        shard_iterators = {}
+        # 2. Get a shard iterator for each shard
+        for shard in shards:
+            shard_id = shard['ShardId']
+            # TRIM_HORIZON: Start reading from the beginning of the shard
+            # LATEST: Start reading from the latest record
+            iterator_response = kinesis_client.get_shard_iterator(
+                StreamName=KINESIS_STREAM_NAME,
+                ShardId=shard_id,
+                ShardIteratorType='LATEST' # Or 'TRIM_HORIZON' for all past data
+            )
+            shard_iterators[shard_id] = iterator_response['ShardIterator']
+            logger.info(f"Initialized iterator for ShardId: {shard_id}")
+
+        start_time = time.time()
+        records_processed = 0
+
+        # 3. Continuously poll for records
+        while (time.time() - start_time) < duration_seconds:
+            for shard_id, iterator in list(shard_iterators.items()): # Use list() to allow modification during iteration
+                try:
+                    get_records_response = kinesis_client.get_records(
+                        ShardIterator=iterator,
+                        Limit=100 # Maximum number of records to retrieve per call
+                    )
+                    records = get_records_response['Records']
+                    new_iterator = get_records_response.get('NextShardIterator')
+
+                    for record in records:
+                        records_processed += 1
+                        data = json.loads(record['Data'].decode('utf-8'))
+                        logger.info(f"  Shard {shard_id} | SeqNum: {record['SequenceNumber']} | Data: {data}")
+
+                    if new_iterator:
+                        shard_iterators[shard_id] = new_iterator
+                    else:
+                        logger.info(f"Shard {shard_id} has no new records and iterator expired.")
+                        del shard_iterators[shard_id] # Remove this shard if iterator is null
+
+                    if not shard_iterators:
+                        logger.info("All shard iterators expired or no shards left to process.")
+                        break # Exit inner loop
+
+                except kinesis_client.exceptions.ProvisionedThroughputExceededException:
+                    logger.warning(f"Provisioned throughput exceeded for ShardId: {shard_id}. Backing off...")
+                    time.sleep(1) # Wait and retry
+                except kinesis_client.exceptions.ExpiredIteratorException:
+                    logger.warning(f"Iterator for ShardId: {shard_id} expired. Re-fetching new iterator (might miss data).")
+                    # This is where KCL excels - it handles iterator management robustly
+                    # For a basic example, we might just try to get a LATEST iterator again or stop.
+                    iterator_response = kinesis_client.get_shard_iterator(
+                        StreamName=KINESIS_STREAM_NAME, ShardId=shard_id, ShardIteratorType='LATEST'
+                    )
+                    shard_iterators[shard_id] = iterator_response['ShardIterator']
+                except Exception as e:
+                    logger.error(f"Error consuming from KDS ShardId {shard_id}: {e}")
+                    # Consider more robust error handling / retry logic
+                    time.sleep(1) # Wait before next attempt
+
+            if not shard_iterators: # Break outer loop if all iterators are gone
+                break
+            time.sleep(1) # Wait before polling all shards again
+
+        logger.info(f"Finished KDS consumer after {duration_seconds} seconds. Processed {records_processed} records.")
+
+    except kinesis_client.exceptions.ResourceNotFoundException:
+        logger.error(f"Kinesis Stream '{KINESIS_STREAM_NAME}' not found. Please create it first.")
+    except Exception as e:
+        logger.error(f"Error initializing Kinesis consumer: {e}")
+
+
+# --- Kinesis Data Firehose Examples ---
+
+# Note: Creating a Kinesis Data Firehose delivery stream via boto3 is complex due to
+# requiring IAM roles, S3 bucket configurations, and potentially Lambda function ARNs.
+# For this example, we assume `FIREHOSE_STREAM_NAME` refers to an *already existing*
+# delivery stream configured, for instance, to deliver to S3.
+
+def firehose_producer_single_record(data_count=5):
+    """
+    Simulates a producer sending individual records to Kinesis Data Firehose.
+    Firehose handles buffering, compression, and delivery automatically.
+    """
+    logger.info(f"\n--- Kinesis Data Firehose Producer (Single Record) ---")
+    for i in range(data_count):
+        data = generate_log_data()
+        record_data = json.dumps(data).encode('utf-8') + b'\n' # Firehose often expects newline delimited records
+
+        try:
+            response = firehose_client.put_record(
+                DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                Record={'Data': record_data}
+            )
+            logger.info(f"Sent record {i+1} to Firehose. RecordId='{response['RecordId']}'")
+            time.sleep(0.1) # Simulate some delay
+        except firehose_client.exceptions.ResourceNotFoundException:
+            logger.error(f"Firehose Delivery Stream '{FIREHOSE_STREAM_NAME}' not found. Please ensure it exists.")
+            break
+        except Exception as e:
+            logger.error(f"Error sending record to Firehose: {e}")
+            break
+    logger.info(f"Finished sending {data_count} single records to {FIREHOSE_STREAM_NAME}.")
+
+def firehose_producer_batch_records(batch_count=3, records_per_batch=5):
+    """
+    Simulates a producer sending records in batches to Kinesis Data Firehose.
+    This is generally more efficient for high-volume scenarios.
+    """
+    logger.info(f"\n--- Kinesis Data Firehose Producer (Batch Records) ---")
+    for b in range(batch_count):
+        records = []
+        for i in range(records_per_batch):
+            data = generate_iot_data()
+            record_data = json.dumps(data).encode('utf-8') + b'\n'
+            records.append({'Data': record_data})
+
+        try:
+            response = firehose_client.put_record_batch(
+                DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                Records=records
+            )
+            failed_count = response.get('FailedPutCount', 0)
+            logger.info(f"Sent batch {b+1} with {len(records)} records. Failed: {failed_count}.")
+            if failed_count > 0:
+                for record_result in response['RequestResponses']:
+                    if 'ErrorCode' in record_result:
+                        logger.error(f"  Failed Record: ErrorCode={record_result['ErrorCode']}, ErrorMessage={record_result['ErrorMessage']}")
+            time.sleep(0.5) # Simulate some delay
+        except firehose_client.exceptions.ResourceNotFoundException:
+            logger.error(f"Firehose Delivery Stream '{FIREHOSE_STREAM_NAME}' not found. Please ensure it exists.")
+            break
+        except Exception as e:
+            logger.error(f"Error sending batch to Firehose: {e}")
+            break
+    logger.info(f"Finished sending {batch_count} batches (total {batch_count * records_per_batch} records) to {FIREHOSE_STREAM_NAME}.")
+
+def firehose_lambda_transformation_concept():
+    """
+    Explains the concept of Kinesis Data Firehose with AWS Lambda transformation.
+    This is a configuration on the Firehose stream itself, not direct Python code execution.
+    """
+    logger.info(f"\n--- Kinesis Data Firehose with AWS Lambda Transformation (Concept) ---")
+    logger.info("Firehose can be configured to invoke an AWS Lambda function to transform incoming data records")
+    logger.info("before they are delivered to the destination (S3, Redshift, OpenSearch).")
+    logger.info("\nScenario:")
+    logger.info("1. Producer sends raw JSON data to Firehose (e.g., {'temp': 25, 'unit': 'C'}).")
+    logger.info("2. Firehose triggers a pre-configured AWS Lambda function.")
+    logger.info("3. The Lambda function receives a batch of records, processes them (e.g., converts 'C' to 'F', adds metadata).")
+    logger.info("   Example Lambda output for a record (must follow specific format):")
+    logger.info("   {")
+    logger.info("     \"recordId\": \"49546986683515007232338000676239129535036130932156828692\",")
+    logger.info("     \"result\": \"Ok\",")
+    logger.info("     \"data\": \"{ \"temperature_fahrenheit\": 77.0, \"unit\": \"F\", \"processed_by\": \"lambda\" }\\n\"")
+    logger.info("   }")
+    logger.info("4. Firehose then delivers the *transformed* data to the destination.")
+    logger.info("\nProblem Solved:")
+    logger.info("   - **Schema Enforcement/Conversion:** Ensure data conforms to a target schema.")
+    logger.info("   - **Data Enrichment:** Add contextual information (e.g., geo-location based on IP).")
+    logger.info("   - **Data Masking/Redaction:** Remove sensitive information before storage.")
+    logger.info("   - **Format Conversion:** Convert from JSON to Parquet/ORC for analytical efficiency.")
+    logger.info("This is fully managed; you only provide the Lambda code, Firehose handles invocation and retries.")
+
+
+# --- Main Execution Flow ---
+
+if __name__ == "__main__":
+    logger.info(f"Starting AWS Data Ingestion Python Examples in region: {REGION}")
+
+    # --- Kinesis Data Streams (KDS) Workflow ---
+    logger.info("\n========== Kinesis Data Streams (KDS) Examples ==========")
+    create_kinesis_stream() # Ensure stream exists
+
+    # Give stream some time to stabilize if just created
+    time.sleep(5)
+
+    if wait_for_stream_status(kinesis_client, KINESIS_STREAM_NAME, 'ACTIVE', kinesis_client.describe_stream):
+        kinesis_producer_single_record(data_count=10)
+        kinesis_producer_batch_records(batch_count=2, records_per_batch=10)
+        kinesis_basic_consumer(duration_seconds=20) # Consumer runs for a short period
+    else:
+        logger.error("Skipping Kinesis Data Streams operations due to stream not being active.")
+
+    # --- Kinesis Data Firehose Workflow ---
+    logger.info("\n========== Kinesis Data Firehose Examples ==========")
+    logger.info(f"NOTE: For Firehose, assume Delivery Stream '{FIREHOSE_STREAM_NAME}' is pre-created and active (e.g., to S3).")
+    # You would typically create this via AWS Console, CloudFormation, or `boto3.client('firehose').create_delivery_stream(...)`
+    # However, `create_delivery_stream` is very verbose due to required IAM roles and destination configurations.
+    # We will just verify its existence and push data.
+    try:
+        firehose_client.describe_delivery_stream(DeliveryStreamName=FIREHOSE_STREAM_NAME)
+        if wait_for_stream_status(firehose_client, FIREHOSE_STREAM_NAME, 'ACTIVE', firehose_client.describe_delivery_stream, stream_type="Kinesis Data Firehose"):
+            firehose_producer_single_record(data_count=10)
+            firehose_producer_batch_records(batch_count=2, records_per_batch=10)
+            firehose_lambda_transformation_concept()
+        else:
+            logger.error(f"Skipping Firehose operations as stream '{FIREHOSE_STREAM_NAME}' is not active.")
+    except firehose_client.exceptions.ResourceNotFoundException:
+        logger.error(f"Firehose Delivery Stream '{FIREHOSE_STREAM_NAME}' not found. Please create it in the AWS Console (e.g., to S3) before running this example.")
+    except Exception as e:
+        logger.error(f"Error checking Firehose stream status: {e}")
+
+
+    # --- Cleanup (Optional, uncomment to run) ---
+    logger.info("\n========== Cleanup (Optional) ==========")
+    # delete_kinesis_stream()
+    logger.info("Cleanup step for Kinesis Data Stream is commented out. Uncomment `delete_kinesis_stream()` to remove the stream.")
+    logger.info("Firehose streams are not deleted by this script and should be managed manually if created via console.")
+
+    logger.info("\nAll examples finished.")
+```
+
+---
+
+### How to Run This Code:
+
+1.  **Install Boto3:**
+    ```bash
+    pip install boto3
+    ```
+
+2.  **Configure AWS Credentials:** Ensure your AWS CLI is configured or set environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`). The code will default to `us-east-1` if `AWS_REGION` is not set.
+
+3.  **Create a Kinesis Data Firehose Delivery Stream (Manually or via CloudFormation):**
+    *   Go to the AWS Console, navigate to Kinesis -> Delivery Streams.
+    *   Click "Create delivery stream".
+    *   Choose a source (e.g., "Direct PUT").
+    *   Set the "Delivery stream name" to `MyUnit2FirehoseStream` (as defined in the Python code).
+    *   Choose a destination (e.g., "Amazon S3").
+    *   Configure an S3 bucket (it will create one if you don't have one).
+    *   Choose "No transformation" for "Record transformation" for this basic example (you can later configure a Lambda for the transformation concept).
+    *   Create the stream. It will take a few minutes to become active.
+
+4.  **Execute the Python Script:**
+    ```bash
+    python your_script_name.py
+    ```
+
+### Key Concepts from the Summary Illustrated in the Code:
+
+*   **Data Ingestion:** The `kinesis_producer_...` and `firehose_producer_...` functions explicitly show sending data into AWS.
+*   **Streaming Data:** The continuous loops in producers and consumers simulate real-time data flow.
+*   **Producers:** Both `kinesis_producer_...` and `firehose_producer_...` act as producers.
+*   **Consumers:** `kinesis_basic_consumer` demonstrates the fundamental reading logic from a stream.
+*   **Shards (Kinesis Data Streams):** `create_kinesis_stream` sets the `ShardCount`, and `kinesis_basic_consumer` explicitly iterates through `shards` to retrieve `shard_iterator`s.
+*   **Partition Key (Kinesis Data Streams):** The `put_record` and `put_records` calls for KDS explicitly use `PartitionKey` (e.g., `device_id`, `user_id`) to ensure related data goes to the same shard.
+*   **Buffering & Compression (Kinesis Data Firehose):** While not directly coded, the `put_record` and `put_record_batch` calls send data to Firehose, which *internally* handles buffering and compression before delivery. The `firehose_producer_batch_records` example implicitly leverages Firehose's efficiency.
+*   **Data Transformation (Kinesis Data Firehose):** The `firehose_lambda_transformation_concept` function explains *how* Lambda integrates with Firehose for transformations, highlighting its purpose and the input/output expectations.
+*   **Fully Managed Services:** Firehose examples highlight that you just `put_record` and Firehose handles the rest (scaling, delivery).
+*   **Kinesis Data Streams (KDS) & Kinesis Data Firehose:** Separate examples clearly differentiate how to interact with each service.
+*   **Amazon S3:** Implied as the destination for the Firehose stream setup (manual step).
+*   **Kinesis Producer Library (KPL):** The `put_records` (batching) in the KDS producer example showcases the underlying API call that KPL would use for efficiency. KPL adds more robust features like aggregation and retries, but `put_records` is the `boto3` way to send multiple records.
+*   **Kinesis Client Library (KCL):** The `kinesis_basic_consumer` function demonstrates the core logic of reading from shards, which KCL abstracts and enhances with checkpointing, load balancing, and error handling. The example notes its limitations compared to KCL.
